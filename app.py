@@ -1,100 +1,275 @@
-import chainlit as cl
-import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
-import faiss
+import streamlit as st
 import pandas as pd
 import numpy as np
-from dotenv import load_dotenv
-import os
- 
-load_dotenv()
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
- 
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-gemini_assistant = genai.GenerativeModel("gemini-2.5-flash")
-faq_vector_index = None
-faq_questions_list = []
-faq_answers_list = []
- 
-def setup_faq_index(data_file="airline_faq.csv"):
-    """Load FAQ data and create FAISS index for semantic search."""
-    global faq_vector_index, faq_questions_list, faq_answers_list
- 
-    faq_df = pd.read_csv(data_file, usecols=["Question", "Answer"])
-    faq_questions_list = faq_df["Question"].dropna().tolist()
-    faq_answers_list = faq_df["Answer"].dropna().tolist()
- 
-    question_embeddings = embedding_model.encode(faq_questions_list, show_progress_bar=False)
-    embedding_dim = question_embeddings.shape[1]
- 
-    faq_vector_index = faiss.IndexFlatL2(embedding_dim)
-    faq_vector_index.add(np.array(question_embeddings).astype("float32"))
- 
-def find_relevant_faqs(user_input, top_k=3):
-    """Search for top-k semantically similar FAQs."""
-    query_embedding = embedding_model.encode([user_input])
-    distances, indices = faq_vector_index.search(np.array(query_embedding).astype("float32"), top_k)
- 
-    results = []
-    for idx in indices[0]:
-        results.append({
-            "question": faq_questions_list[idx],
-            "answer": faq_answers_list[idx]
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import google.generativeai as genai
+import io
+
+st.set_page_config(page_title="Aurora Skies Airways FAQ Chatbot",
+                   page_icon="✈️",
+                   layout="wide")
+
+st.markdown("""
+    <style>
+    .main {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+    .stTextInput > div > div > input {
+        background-color: white;
+    }
+    .chat-message {
+        padding: 1.5rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+        display: flex;
+        flex-direction: column;
+    }
+    .user-message {
+        background-color: #2b5797;
+        color: white;
+        margin-left: 20%;
+    }
+    .assistant-message {
+        background-color: #ffffff;
+        color: #000000;
+        margin-right: 20%;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .source-info {
+        font-size: 0.85rem;
+        color: #666;
+        margin-top: 0.5rem;
+        padding-top: 0.5rem;
+        border-top: 1px solid #e0e0e0;
+    }
+    </style>
+""",
+            unsafe_allow_html=True)
+
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'faq_data' not in st.session_state:
+    st.session_state.faq_data = None
+if 'vectorizer' not in st.session_state:
+    st.session_state.vectorizer = None
+if 'tfidf_matrix' not in st.session_state:
+    st.session_state.tfidf_matrix = None
+
+def load_faq_data():
+    """Load FAQ data from CSV string"""
+    df = pd.read_csv(io.StringIO(airline_faq.csv))
+    return df
+
+
+def initialize_rag_system(faq_df):
+    """Initialize the RAG system with TF-IDF vectorization"""
+    # Combine question and answer for better retrieval
+    documents = (faq_df['Question'] + ' ' + faq_df['Answer']).tolist()
+
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+    tfidf_matrix = vectorizer.fit_transform(documents)
+
+    return vectorizer, tfidf_matrix
+
+
+def retrieve_relevant_faqs(query, vectorizer, tfidf_matrix, faq_df, top_k=3):
+    # Transform query
+    query_vector = vectorizer.transform([query])
+
+    similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
+
+    top_indices = similarities.argsort()[-top_k:][::-1]
+
+    relevant_faqs = []
+    for idx in top_indices:
+        if similarities[idx] > 0.1:  # Minimum similarity threshold
+            relevant_faqs.append({
+                'question': faq_df.iloc[idx]['Question'],
+                'answer': faq_df.iloc[idx]['Answer'],
+                'score': similarities[idx]
+            })
+
+    return relevant_faqs
+
+
+def generate_answer_with_gemini(query, relevant_faqs, api_key):
+    """Generate answer using Gemini API"""
+    try:
+        # Configure Gemini
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+
+        # Build context from relevant FAQs
+        context = "\n\n".join([
+            f"FAQ {i+1}:\nQ: {faq['question']}\nA: {faq['answer']}"
+            for i, faq in enumerate(relevant_faqs)
+        ])
+
+        # Create prompt
+        prompt = f"""You are a helpful customer service assistant for Aurora Skies Airways. 
+Based on the following FAQ information, answer the user's question accurately and concisely.
+
+FAQ Context:
+{context}
+
+User Question: {query}
+
+Instructions:
+- Provide a clear, helpful answer based on the FAQ information above
+- If the information isn't in the FAQs, politely say so and suggest contacting customer service
+- Be professional and friendly
+- Keep your answer concise but complete
+
+Answer:"""
+
+        # Generate response
+        response = model.generate_content(prompt)
+        return response.text, relevant_faqs
+
+    except Exception as e:
+        return f"Error generating response: {str(e)}", relevant_faqs
+
+
+with st.sidebar:
+    st.title("⚙️ Configuration")
+
+    # API Key input
+    api_key = st.text_input(
+        "Gemini API Key",
+        type="password",
+        help="Get your API key from https://aistudio.google.com/app/apikey")
+
+    st.markdown("---")
+
+    st.subheader("📤 Upload Custom FAQs")
+    uploaded_file = st.file_uploader(
+        "Upload FAQ CSV",
+        type=['csv'],
+        help="CSV file with 'Question' and 'Answer' columns")
+
+    if uploaded_file is not None:
+        try:
+            uploaded_df = pd.read_csv(uploaded_file)
+
+            if 'Question' in uploaded_df.columns and 'Answer' in uploaded_df.columns:
+                if st.button("Load Custom FAQs"):
+                    st.session_state.faq_data = uploaded_df
+                    st.session_state.vectorizer, st.session_state.tfidf_matrix = initialize_rag_system(
+                        uploaded_df)
+                    st.session_state.messages = []
+                    st.success(
+                        f"✅ Loaded {len(uploaded_df)} FAQs successfully!")
+                    st.rerun()
+            else:
+                st.error("⚠️ CSV must have 'Question' and 'Answer' columns")
+        except Exception as e:
+            st.error(f"Error reading CSV: {str(e)}")
+
+    if st.button("Reset to Default FAQs"):
+        st.session_state.faq_data = load_faq_data()
+        st.session_state.vectorizer, st.session_state.tfidf_matrix = initialize_rag_system(
+            st.session_state.faq_data)
+        st.session_state.messages = []
+        st.success("✅ Reset to default FAQs")
+        st.rerun()
+
+    st.markdown("---")
+
+    st.markdown("""
+    ### About
+    This chatbot uses:
+    - **RAG** (Retrieval-Augmented Generation)
+    - **TF-IDF** for document retrieval
+    - **Gemini API** for response generation
+    
+    ### How it works
+    1. Your question is processed
+    2. Relevant FAQs are retrieved
+    3. Gemini generates a contextual answer
+    """)
+
+    if st.button("Clear Chat History"):
+        st.session_state.messages = []
+        st.rerun()
+
+st.title("✈️ Aurora Skies Airways FAQ Chatbot")
+st.markdown("Ask me anything about refunds, cancellations, or flight changes!")
+
+if st.session_state.faq_data is None:
+    with st.spinner("Loading FAQ database..."):
+        st.session_state.faq_data = load_faq_data()
+        st.session_state.vectorizer, st.session_state.tfidf_matrix = initialize_rag_system(
+            st.session_state.faq_data)
+
+for message in st.session_state.messages:
+    role = message["role"]
+    content = message["content"]
+
+    if role == "user":
+        st.markdown(f"""
+        <div class="chat-message user-message">
+            <strong>You:</strong><br>{content}
+        </div>
+        """,
+                    unsafe_allow_html=True)
+    else:
+        sources_html = ""
+        if "sources" in message and message["sources"]:
+            sources_html = "<div class='source-info'><strong>📚 Relevant FAQs:</strong><br>"
+            for i, source in enumerate(message["sources"], 1):
+                sources_html += f"{i}. {source['question'][:100]}...<br>"
+            sources_html += "</div>"
+
+        st.markdown(f"""
+        <div class="chat-message assistant-message">
+            <strong>Assistant:</strong><br>{content}
+            {sources_html}
+        </div>
+        """,
+                    unsafe_allow_html=True)
+
+user_input = st.chat_input("Type your question here...")
+
+if user_input:
+    if not api_key:
+        st.error(
+            "⚠️ Please enter your Gemini API key in the sidebar to continue.")
+    else:
+        st.session_state.messages.append({
+            "role": "user",
+            "content": user_input
         })
-    return results
- 
-def generate_assistant_reply(user_input, matched_faqs):
-    """Generate a response using Gemini model based on matched FAQs."""
-    faq_context_block = "\n\n".join([
-        f"FAQ {i+1}:\nQ: {faq['question']}\nA: {faq['answer']}"
-        for i, faq in enumerate(matched_faqs)
-    ])
- 
-    prompt = f"""
-You are Aurora Skies Airways' virtual assistant.
-Respond strictly using the FAQs below. If the answer isn't found, say:
-"I don't have specific information about that in our FAQ database. Please contact Aurora Skies Airways customer service for assistance."
- 
-FAQs:
-{faq_context_block}
- 
-Customer Query: {user_input}
- 
-Response:"""
- 
-    response = gemini_assistant.generate_content(prompt)
-    return response.text
- 
-# Build index on startup
-setup_faq_index()
- 
-@cl.on_chat_start
-async def welcome_user():
-    await cl.Message(content="You can ask Your Queries from our AI ChatBot Developed by SDE at CG Infinity").send()
-    await cl.Message(
-        content="""👋 Hi there! I'm your travel assistant from **Aurora Skies Airways**.
- 
-I can help you with common inquiries
- 
-How can I assist you today?""",
-       
-    ).send()
- 
-@cl.on_message
-async def process_user_query(message: cl.Message):
-    loading = cl.Message(content="🔍 Evaluating...")
-    await loading.send()
- 
-    matched_faqs = find_relevant_faqs(message.content, top_k=3)
-    loading.content = "🧠 Thinking..."
-    await loading.update()
- 
-    assistant_reply = generate_assistant_reply(message.content, matched_faqs)
-    await loading.remove()
- 
-    await cl.Message(content=assistant_reply, author="Aurora Assistant ✨").send()
- 
-    reference_note = "\n\n**📚 FAQ Sources:**\n"
-    for i, faq in enumerate(matched_faqs[:2], 1):
-        reference_note += f"\n{i}. *{faq['question']}*"
-    await cl.Message(content=reference_note).send()
+
+        st.markdown(f"""
+        <div class="chat-message user-message">
+            <strong>You:</strong><br>{user_input}
+        </div>
+        """,
+                    unsafe_allow_html=True)
+
+        with st.spinner("Thinking..."):
+            # Retrieve relevant FAQs
+            relevant_faqs = retrieve_relevant_faqs(
+                user_input, st.session_state.vectorizer,
+                st.session_state.tfidf_matrix, st.session_state.faq_data)
+
+            answer, sources = generate_answer_with_gemini(
+                user_input, relevant_faqs, api_key)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+                "sources": sources
+            })
+
+        # Rerun to display new messages
+        st.rerun()
+
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: white; padding: 1rem;'>
+    <p>Aurora Skies Airways FAQ Chatbot | Powered by Gemini AI</p>
+</div>
+""",
+            unsafe_allow_html=True)
