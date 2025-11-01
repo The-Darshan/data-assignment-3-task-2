@@ -4,7 +4,7 @@ An intelligent chatbot powered by Google's Gemini AI model that answers airline-
 
 ## Screenshot
 
-<img src='./Screenshot1.png'>
+<img src='./Screenshot.png'>
 
 
 ## 🚀 Getting Started
